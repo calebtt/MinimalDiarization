@@ -1,0 +1,3 @@
+[submodule "MinimalSileroVad"]
+	path = MinimalSileroVad
+	url = https://github.com/calebtt/MinimalSileroVad.git
