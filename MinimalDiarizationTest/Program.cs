@@ -37,11 +37,14 @@ public static partial class Algos
         return bytes;
     }
 
-    // Simple clustering threshold (e.g., >0.8 same speaker)
-    public const float SpeakerChangeThreshold = 0.75f;
+    // Tunable: Lower for noisy envs like movies (ECAPA baseline ~0.6-0.8)
+    public const float SpeakerMatchThreshold = 0.4f;
 }
 
-// Minimal diarization test app: Mic -> VAD segments -> ECAPA embeddings -> similarity logging.
+// Speaker record: Immutable, holds ID + embedding for clustering
+public record Speaker(int Id, float[] Embedding);
+
+// Minimal diarization test app: Mic -> VAD segments -> ECAPA embeddings -> multi-speaker clustering.
 // Requires: silero_vad.onnx in /models/, ecapa_tdnn.onnx in /models/.
 internal static class Program
 {
@@ -52,10 +55,8 @@ internal static class Program
 
     private static double audioTimeSec = 0;  // Running time counter (s)
 
-    // For speaker tracking: last embedding and speaker ID
-    private static float[]? _lastEmbedding;
-    private static int _currentSpeakerId = 0;
-    private static readonly List<(double time, float[] embedding, int speakerId)> _speakerHistory = new();
+    // For speaker tracking: List of known speakers
+    private static readonly List<Speaker> _knownSpeakers = new();
 
     // Static model instance for event handler access
     private static EcapaTdnnModel? _ecapaModel;
@@ -81,6 +82,7 @@ internal static class Program
 
             Log.Information("Starting MinimalDiarizationTest");
             Log.Information("EnableEcho: {EnableEcho}", EnableEcho);
+            Log.Information("SpeakerMatchThreshold: {Thresh} (tune lower for noisy audio)", Algos.SpeakerMatchThreshold);
 
             using var segmenter = new VadSpeechSegmenterSileroV5(msPerFrame: ChunkDurationMs);
             segmenter.SentenceBegin += OnSentenceBegin;
@@ -100,9 +102,9 @@ internal static class Program
             }
 
             // Final summary
-            Log.Information("Diarization Summary:");
-            foreach (var (time, _, sid) in _speakerHistory)
-                Log.Information("  Speaker {Sid} at {Time:F2}s", sid, time);
+            Log.Information("Diarization Summary ({Count} speakers detected):", _knownSpeakers.Count);
+            foreach (var speaker in _knownSpeakers)
+                Log.Information("  Speaker {Id}: {Segments} segments (first at inferred time)", speaker.Id, 1 /* Placeholder; track per-ID count if needed */);
         }
         catch (Exception ex)
         {
@@ -112,6 +114,7 @@ internal static class Program
         {
             ecapaModel?.Dispose();  // Explicit dispose
             _ecapaModel = null;
+            _knownSpeakers.Clear();  // Cleanup
             Log.CloseAndFlush();
         }
     }
@@ -137,31 +140,47 @@ internal static class Program
         var pcmSpan = sentencePcm.ToArray().AsSpan();
         var embedding = _ecapaModel.ExtractEmbedding(pcmSpan);
 
-        // Detect speaker change via cosine sim
-        if (_lastEmbedding != null)
+        // Find best match among known speakers (online clustering)
+        int assignedId = -1;
+        float maxSim = -1f;
+        if (_knownSpeakers.Count > 0)
         {
-            var sim = Algos.CosineSimilarity(embedding, _lastEmbedding);
-            var isSameSpeaker = sim > Algos.SpeakerChangeThreshold;
-            if (!isSameSpeaker)
+            foreach (var known in _knownSpeakers)
             {
-                _currentSpeakerId++;
-                Log.Information("*** Speaker Change Detected (sim={Sim:F3}) → Speaker {_currentSpeakerId} ***", sim, _currentSpeakerId);
+                var sim = Algos.CosineSimilarity(embedding, known.Embedding.AsSpan());
+                if (sim > maxSim)
+                {
+                    maxSim = sim;
+                    assignedId = known.Id;
+                }
+            }
+
+            if (maxSim >= Algos.SpeakerMatchThreshold)
+            {
+                Log.Information("*** Assigned to Speaker {Id} (max sim={Sim:F3}) ***", assignedId, maxSim);
             }
             else
             {
-                Log.Information("*** Same Speaker Continued (sim={Sim:F3}) → Speaker {_currentSpeakerId} ***", sim, _currentSpeakerId);
+                // New speaker
+                assignedId = _knownSpeakers.Count;  // Next ID
+                Log.Information("*** New Speaker {Id} (max sim={Sim:F3} < {Thresh:F3}) ***", assignedId, maxSim, Algos.SpeakerMatchThreshold);
             }
         }
         else
         {
-            Log.Information("*** New Speaker {_currentSpeakerId} (first segment) ***", _currentSpeakerId);
+            // First speaker
+            assignedId = 0;
+            Log.Information("*** New Speaker {Id} (first segment) ***", assignedId);
         }
 
-        // Track history
-        _speakerHistory.Add((audioTimeSec, embedding.ToArray(), _currentSpeakerId));
-        _lastEmbedding = embedding.ToArray();  // Retain for next
+        // Add/update: Store embedding for this speaker (overwrite for stability; avg if needed later)
+        var embeddingArray = embedding.ToArray();
+        var existing = _knownSpeakers.FirstOrDefault(s => s.Id == assignedId);
+        if (existing != null)
+            _knownSpeakers.Remove(existing);  // Replace for latest
+        _knownSpeakers.Add(new Speaker(assignedId, embeddingArray));
 
-        // Optional: Log partial embedding stats (e.g., norm check)
+        // Optional: Log embedding norm for debugging
         var embNorm = embedding.Aggregate(0f, (sum, x) => sum + x * x);
         Log.Debug("Embedding norm: {Norm:F3}", MathF.Sqrt(embNorm));
     }
