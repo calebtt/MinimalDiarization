@@ -133,7 +133,7 @@ public class SttProviderStreaming : IDisposable
     public event EventHandler<string>? TranscriptionComplete; // Fired when complete transcription is ready
     static object _downloadLock = new();
 
-    public SttProviderStreaming(string modelUrl)
+    public SttProviderStreaming(string modelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin")
     {
         // Resolve local path (e.g., ./models/{filename})
         var filename = Path.GetFileName(modelUrl);

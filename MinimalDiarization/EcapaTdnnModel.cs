@@ -3,7 +3,7 @@ using Microsoft.ML.OnnxRuntime.Tensors;
 using System.Numerics;
 using Serilog;
 
-namespace MinimalEcapaDiarization.Core;
+namespace MinimalDiarization.Core;
 
 public class EcapaTdnnModel : IDisposable
 {

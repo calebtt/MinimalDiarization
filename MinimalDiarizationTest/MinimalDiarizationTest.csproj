@@ -5,6 +5,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+	  <LangVersion>13.0</LangVersion>
   </PropertyGroup>
 
 	<ItemGroup>
@@ -24,11 +25,13 @@
   </ItemGroup>
 	
   <ItemGroup>
-    <Folder Include="models\" />
-  </ItemGroup>
-	
-  <ItemGroup>
     <None Update="models\ecapa_tdnn.onnx">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="models\dialogpt-small-onnx.onnx">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="models\tokenizer.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
