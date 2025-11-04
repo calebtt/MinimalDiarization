@@ -1,6 +1,9 @@
 ﻿using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
-using Microsoft.ML.Tokenizers;
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.SemanticKernel.Connectors.Onnx;
+using Microsoft.Extensions.AI;
 using MinimalDiarization.Core;
 using MinimalSileroVAD.Core;  // For VadSpeechSegmenterSileroV5
 using MinimalVadTest;
@@ -57,7 +60,7 @@ internal static class Program
     private static SpeakerTracker? _speakerTracker;
     private static EcapaTdnnModel? _ecapaModel;
     private static UserEmbedding? _userEmbedding;
-    private static IntentPreprocessor? _intentPreprocessor;
+    private static CommandIntentClassifier? _intentPreprocessor;
     private static SttProviderStreaming? _sttProvider;
     private static CancellationTokenSource _cts = new();
 
@@ -68,7 +71,23 @@ internal static class Program
             .MinimumLevel.Information()
             .CreateLogger();
 
-        TestIntentPreprocessor();
+        var modelFolder = Path.Combine(AppContext.BaseDirectory, "models", "phi3-mini");
+        var builder = Kernel.CreateBuilder();
+
+        // Now works with genai_config.json present
+        builder.Services.AddOnnxRuntimeGenAIChatCompletion(
+            modelId: "phi3-mini",
+            modelPath: modelFolder,  // Folder path—loads genai_config.json automatically
+            serviceId: "phi3-onnx"
+        );
+
+        var kernel = builder.Build();
+        var chatService = kernel.GetRequiredService<IChatCompletionService>();
+        _intentPreprocessor = new CommandIntentClassifier(chatService);
+
+        await TestIntentPreprocessor(_intentPreprocessor);
+
+        Console.ReadKey();
 
         try
         {
@@ -82,8 +101,6 @@ internal static class Program
             _sttProvider = new SttProviderStreaming();
 
             await EnrollOrLoadVoice(_ecapaModel);
-
-            _intentPreprocessor = new IntentPreprocessor();
 
             Log.Information("Starting MinimalDiarizationTest");
             Log.Information("EnableEcho: {EnableEcho}", EnableEcho);
@@ -106,26 +123,35 @@ internal static class Program
         catch (Exception ex) { Log.Error(ex, "Application error"); }
         finally
         {
-            _intentPreprocessor?.Dispose();
             _speakerTracker?.Dispose();
             _ecapaModel?.Dispose();
         }
     }
 
-    private static void TestIntentPreprocessor()
+    private static async Task TestIntentPreprocessor(CommandIntentClassifier intent)
     {
-        using var intentPreprocessor = new IntentPreprocessor();
-        var testCommands = new[]
+        var tests = new[]
         {
-            "Hey master, turn on the lights.",
-            "Speaker 2, please play some music.",
-            "What's the weather like today?",
-            "Master, set a timer for 10 minutes."
-        };
-        foreach (var command in testCommands)
+        ("Hey computer, turn on the lights.", true),
+        ("What's the weather?", true),
+        ("Play music.", true),
+        ("Who are you?", false),
+        ("I'll make sure you feel confident the whole way through.", false),
+        ("Please open the pod bay doors.", true),
+        ("Can you tell me a joke?", true),
+        ("This is a random sentence.", false),
+        ("Computer, initiate self-destruct sequence.", true),
+        ("I love programming.", false),
+        ("There's a snake in my boot.", false)
+    };
+
+        foreach (var (cmd, expected) in tests)
         {
-            var (isCommand, respondTo) = intentPreprocessor.Analyze(command, new Speaker(SpeakerType.Master, 1, Array.Empty<float>()));
-            Log.Information("Test Command: \"{Command}\" => isCommand={IsCommand}, respondTo={RespondTo}", command, isCommand, respondTo);
+            var speaker = cmd.Contains("master") ? new Speaker(SpeakerType.Master, 0, new float[192])
+                         : new Speaker(SpeakerType.Other, 1, new float[192]);
+
+            bool isCmd = await intent.IsCommandAsync(cmd, speaker);
+            Log.Information("Test: \"{Cmd}\" -> {Result} (expected: {Exp})", cmd, isCmd ? "YES" : "NO", expected ? "YES" : "NO");
         }
     }
 
@@ -197,9 +223,9 @@ internal static class Program
         }
 
         // ---- Intent (runs on **every** transcription) ----------------
-        var (isCommand, respondTo) = _intentPreprocessor!.Analyze(transcript, assigned);
-        Log.Information("IP: Intent Analysis: isCommand={IsCommand}, respondTo={RespondTo}", isCommand, respondTo);
-        if (isCommand && (respondTo == "master" || respondTo == $"speaker_{assigned.Id}"))
+        var isCommand = await _intentPreprocessor!.IsCommandAsync(transcript, assigned);
+        Log.Information("IP: Intent Analysis: isCommand={IsCommand}, respondTo={RespondTo}", isCommand);
+        if (isCommand)
         {
             await ProcessCommandAsync(transcript);
         }

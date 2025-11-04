@@ -16,10 +16,24 @@
   </ItemGroup>
 
   <ItemGroup>
-		  <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.23.1" />
-		  <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0-preview.25527.5" />
-		  <!-- Update to latest if tested -->
-		  <PackageReference Include="Serilog" Version="4.3.0" />
+	  <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.23.2" />
+	  <PackageReference Include="Microsoft.ML.OnnxRuntime.Extensions" Version="0.14.0" />
+	  <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0-preview.25527.5" />
+	  <PackageReference Include="Microsoft.SemanticKernel" Version="1.66.0" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Abstractions" Version="1.67.0" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Agents.OpenAI" Version="1.66.0-preview" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Connectors.HuggingFace" Version="1.67.0-preview" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Connectors.MistralAI" Version="1.66.0-alpha" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Connectors.Onnx" Version="1.67.0-alpha" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.67.0" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Plugins.AI" Version="1.66.0-alpha" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Plugins.Core" Version="1.66.0-preview" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Plugins.Memory" Version="1.66.0-alpha" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Plugins.OpenApi" Version="1.66.0" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Plugins.OpenApi.Extensions" Version="1.66.0-alpha" />
+	  <PackageReference Include="Microsoft.SemanticKernel.Plugins.Web" Version="1.66.0-alpha" />
+	  <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu" Version="1.23.1" />
+	  <PackageReference Include="Serilog" Version="4.3.0" />
   </ItemGroup>
 
 </Project>
