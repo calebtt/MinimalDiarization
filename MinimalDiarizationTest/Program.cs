@@ -1,4 +1,6 @@
 ﻿using Microsoft.ML.OnnxRuntime;
+using Microsoft.ML.OnnxRuntime.Tensors;
+using Microsoft.ML.Tokenizers;
 using MinimalDiarization.Core;
 using MinimalSileroVAD.Core;  // For VadSpeechSegmenterSileroV5
 using MinimalVadTest;
@@ -38,16 +40,8 @@ public static partial class Algos
         return bytes;
     }
 
-    public static async Task<string> TranscribeAudio(SttProviderStreaming stt, MemoryStream pcmStream)
-    {
-        await stt.ProcessAudioChunkAsync(pcmStream);
-        var transcript = await stt.WaitForCompleteTranscriptionAsync();
-        stt.Dispose();  // RAII
-        return transcript ?? string.Empty;
-    }
-
     // Tunable: Lower for noisy envs like movies (ECAPA baseline ~0.6-0.8)
-    public const float SpeakerMatchThreshold = 0.4f;
+    public const float SpeakerMatchThreshold = 0.6f;
 }
 
 
@@ -60,12 +54,12 @@ internal static class Program
 
     private static double audioTimeSec = 0;
 
-    private static readonly List<Speaker> _knownSpeakers = new();
+    private static SpeakerTracker? _speakerTracker;
     private static EcapaTdnnModel? _ecapaModel;
     private static UserEmbedding? _userEmbedding;
-    private static readonly List<(double time, float[] embedding, string label)> _history = new();
-    private static IntentPreprocessor? _intentPreprocessor;  // New
-    private static SttProviderStreaming? _stt;  // Reusable STT
+    private static IntentPreprocessor? _intentPreprocessor;
+    private static SttProviderStreaming? _sttProvider;
+    private static CancellationTokenSource _cts = new();
 
     private static async Task Main(string[] _)
     {
@@ -74,7 +68,8 @@ internal static class Program
             .MinimumLevel.Information()
             .CreateLogger();
 
-        EcapaTdnnModel? ecapaModel = null;
+        TestIntentPreprocessor();
+
         try
         {
             var modelPath = Path.Combine("models", "ecapa_tdnn.onnx");
@@ -82,13 +77,13 @@ internal static class Program
                 throw new FileNotFoundException($"ECAPA model not found at {modelPath}; run export_ecapa_onnx.py to generate.");
 
             await using var modelFile = File.OpenRead(modelPath);
-            ecapaModel = new EcapaTdnnModel(modelFile);
-            _ecapaModel = ecapaModel;
+            _ecapaModel = new EcapaTdnnModel(modelFile);
+            _speakerTracker = new SpeakerTracker(_ecapaModel);
+            _sttProvider = new SttProviderStreaming();
 
             await EnrollOrLoadVoice(_ecapaModel);
 
-            _stt = new SttProviderStreaming();  // Your model path
-            _intentPreprocessor = new IntentPreprocessor();  // LLM init
+            _intentPreprocessor = new IntentPreprocessor();
 
             Log.Information("Starting MinimalDiarizationTest");
             Log.Information("EnableEcho: {EnableEcho}", EnableEcho);
@@ -98,199 +93,127 @@ internal static class Program
             segmenter.SentenceBegin += OnSentenceBegin;
             segmenter.SentenceCompleted += OnSentenceCompleted;
 
-            using var cts = new CancellationTokenSource();
-            Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-            Log.Information("Press Ctrl+C to stop…");
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; _cts.Cancel(); };
+            Log.Information("Starting microphone capture... (Ctrl+C to stop)");
 
             int chunkCounter = 0;
-            await foreach (var rawChunk in CaptureAndEchoMicrophoneChunksAsync(ChunkSamples, EnableEcho, cts.Token))
+            await foreach (var chunk in CaptureAndEchoMicrophoneChunksAsync(ChunkSamples, EnableEcho, _cts.Token))
             {
-                if (cts.Token.IsCancellationRequested) break;
-                chunkCounter++;
-
-                ProcessChunk(segmenter, rawChunk, cts.Token, chunkCounter);
+                ProcessChunk(segmenter, chunk, _cts.Token, chunkCounter++);
             }
-
-            // Final summary
-            Log.Information("Diarization Summary ({Count} speakers detected):", _knownSpeakers.Count);
-            var master = _knownSpeakers.FirstOrDefault(s => s.Type == SpeakerType.Master);
-            Log.Information("  Master (You): {Count} segments", master?.SegmentCount ?? 0);
-            foreach (var speaker in _knownSpeakers.Where(s => s.Type == SpeakerType.Other))
-                Log.Information("  Other Speaker {Id}: {Count} segments", speaker.Id, speaker.SegmentCount);
         }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Application error: {ex}", ex.Message);
-        }
+        catch (OperationCanceledException) { Log.Information("Capture stopped (Ctrl+C)."); }
+        catch (Exception ex) { Log.Error(ex, "Application error"); }
         finally
         {
-            ecapaModel?.Dispose();
-            _ecapaModel = null;
-            _stt?.Dispose();
             _intentPreprocessor?.Dispose();
-            _knownSpeakers.Clear();
-            _history.Clear();
-            Log.CloseAndFlush();
+            _speakerTracker?.Dispose();
+            _ecapaModel?.Dispose();
+        }
+    }
+
+    private static void TestIntentPreprocessor()
+    {
+        using var intentPreprocessor = new IntentPreprocessor();
+        var testCommands = new[]
+        {
+            "Hey master, turn on the lights.",
+            "Speaker 2, please play some music.",
+            "What's the weather like today?",
+            "Master, set a timer for 10 minutes."
+        };
+        foreach (var command in testCommands)
+        {
+            var (isCommand, respondTo) = intentPreprocessor.Analyze(command, new Speaker(SpeakerType.Master, 1, Array.Empty<float>()));
+            Log.Information("Test Command: \"{Command}\" => isCommand={IsCommand}, respondTo={RespondTo}", command, isCommand, respondTo);
         }
     }
 
     private static async Task EnrollOrLoadVoice(EcapaTdnnModel ecapaModel)
     {
-        var userEnroller = new UserVoiceEnroller(ecapaModel);
-
-        _userEmbedding = await userEnroller.LoadAsync();
-        if (_userEmbedding != null)
+        var enroller = new UserVoiceEnroller(ecapaModel);
+        _userEmbedding = await enroller.LoadAsync();
+        if (_userEmbedding == null)
         {
-            Log.Information("Loaded existing enrollment — Skipping re-enrollment.");
+            Log.Information("IP: No enrollment found. Starting enrollment...");
+            _userEmbedding = await enroller.EnrollAsync(_cts.Token);
+            if (_userEmbedding == null)
+            {
+                Log.Warning("IP: Enrollment failed; skipping user verification.");
+                return;
+            }
         }
         else
         {
-            _userEmbedding = await userEnroller.EnrollAsync();
+            Log.Information("IP: Loaded existing enrollment - Skipping re-enrollment.");
         }
+
+        // Register the master with the tracker
+        _speakerTracker!.RegisterMaster(_userEmbedding.Embedding);
     }
 
-    private static void OnSentenceBegin(object? sender, object e)
+    private static void OnSentenceBegin(object? sender, EventArgs e)
     {
-        Log.Information("*** Speech Begin at {Time:F2}s ***", audioTimeSec);
+        // startSec is not available in EventArgs; we'll use audioTimeSec as approximation
+        Log.Information("IP: *** Speech Begin at {Start}s ***", audioTimeSec);
     }
 
-    private static async void OnSentenceCompleted(object? sender, MemoryStream sentencePcm)
+    private static void OnSentenceCompleted(object? sender, MemoryStream pcmStream)
     {
-        var durationSeconds = sentencePcm.Length / 2f / AudioSampleRate;
-        Log.Information("*** Speech Completed at {Time:F2}s — Duration {Dur:F2}s ({Bytes} bytes) ***",
-            audioTimeSec, durationSeconds, sentencePcm.Length);
+        // Fire and forget async
+        _ = OnSentenceCompletedAsync(pcmStream, _cts.Token);
+    }
 
-        if (_ecapaModel == null || _stt == null)
+    private static async Task OnSentenceCompletedAsync(MemoryStream pcmStream, CancellationToken ct)
+    {
+        var pcmBytes = pcmStream.ToArray();
+        var endSec = audioTimeSec;
+        var dur = (double)pcmBytes.Length / (AudioSampleRate * 2);
+        var startSec = endSec - dur;
+
+        Log.Information("IP: *** Speech Completed at {End}s - Duration {Dur}s ({Bytes} bytes) ***", endSec, dur, pcmBytes.Length);
+
+        if (pcmBytes.Length < AudioSampleRate * 1) // <1 s
         {
-            Log.Error("ECAPA or STT not initialized; skipping.");
+            Log.Information("IP: Skipping short segment (<1s).");
             return;
         }
 
-        // Extract embedding
-        var pcmSpan = sentencePcm.ToArray().AsSpan();
-        var embedding = _ecapaModel.ExtractEmbedding(pcmSpan);
+        // ---- Embedding ------------------------------------------------
+        float[] embedding = _ecapaModel!.ExtractEmbedding(pcmBytes.AsSpan());
 
-        // Master Check (user embedding)
-        SpeakerType assignedType = SpeakerType.Other;
-        int assignedId = -1;
-        float maxSim = -1f;
-        if (_userEmbedding != null)
+        // ---- Speaker assignment ---------------------------------------
+        Speaker assigned = _speakerTracker!.AssignSpeaker(embedding, startSec);
+
+        // ---- STT ------------------------------------------------------
+        pcmStream.Position = 0;
+        await _sttProvider!.ProcessAudioChunkAsync(pcmStream);
+        var transcript = await _sttProvider.WaitForCompleteTranscriptionAsync(ct);
+
+        if (string.IsNullOrWhiteSpace(transcript))
         {
-            var userSim = Algos.CosineSimilarity(embedding, _userEmbedding.Embedding.AsSpan());
-            if (userSim >= Algos.UserVoiceThreshold)
-            {
-                assignedType = SpeakerType.Master;
-                assignedId = 0;
-                maxSim = userSim;
-                Log.Information("*** Master (You) Speaking (sim={Sim:F3} ≥ {Thresh:F3}) ***", maxSim, Algos.UserVoiceThreshold);
-            }
+            //Log.Information("Streaming STT: Processing failed (empty transcript).");
+            return;
         }
 
-        // Fallback clustering for others
-        if (assignedType == SpeakerType.Other)
+        // ---- Intent (runs on **every** transcription) ----------------
+        var (isCommand, respondTo) = _intentPreprocessor!.Analyze(transcript, assigned);
+        Log.Information("IP: Intent Analysis: isCommand={IsCommand}, respondTo={RespondTo}", isCommand, respondTo);
+        if (isCommand && (respondTo == "master" || respondTo == $"speaker_{assigned.Id}"))
         {
-            if (_knownSpeakers.Count > 0)
-            {
-                float otherMaxSim = -1f;
-                int otherId = -1;
-                foreach (var known in _knownSpeakers.Where(s => s.Type == SpeakerType.Other))
-                {
-                    var sim = Algos.CosineSimilarity(embedding, known.Embedding.AsSpan());
-                    if (sim > otherMaxSim)
-                    {
-                        otherMaxSim = sim;
-                        otherId = known.Id;
-                    }
-                }
-                maxSim = otherMaxSim;
-
-                if (otherMaxSim >= Algos.SpeakerMatchThreshold)
-                {
-                    assignedId = otherId;
-                    Log.Information("*** Assigned to Other Speaker {Id} (sim={Sim:F3}) ***", assignedId, maxSim);
-                }
-                else
-                {
-                    assignedId = _knownSpeakers.Where(s => s.Type == SpeakerType.Other).DefaultIfEmpty(new Speaker(SpeakerType.Other, 0, new float[0])).Max(s => s.Id) + 1;
-                    Log.Information("*** New Other Speaker {Id} (sim={Sim:F3} < {Thresh:F3}) ***", assignedId, maxSim, Algos.SpeakerMatchThreshold);
-                }
-            }
-            else
-            {
-                assignedId = 1;
-                Log.Information("*** New Other Speaker {Id} (first non-master) ***", assignedId);
-            }
+            await ProcessCommandAsync(transcript);
         }
-
-        // Update/Add speaker
-        var embeddingArray = embedding.ToArray();
-        var existing = _knownSpeakers.FirstOrDefault(s => s.Type == assignedType && s.Id == assignedId);
-        if (existing != null)
-        {
-            var updatedCount = existing.SegmentCount + 1;
-            _knownSpeakers.Remove(existing);
-            _knownSpeakers.Add(new Speaker(assignedType, assignedId, embeddingArray, updatedCount));
-        }
-        else
-        {
-            _knownSpeakers.Add(new Speaker(assignedType, assignedId, embeddingArray, 1));
-        }
-
-        // Transcription + LLM
-        var transcript = await Algos.TranscribeAudio(_stt, sentencePcm);
-        if (!string.IsNullOrWhiteSpace(transcript) && _intentPreprocessor != null && IsPotentialCommand(transcript))
-        {
-            var currentSpeaker = new Speaker(assignedType, assignedId, embeddingArray);
-            var (isCommand, respondTo) = _intentPreprocessor.Analyze(transcript, currentSpeaker);
-            if (isCommand)
-            {
-                if (respondTo == "master")
-                {
-                    Log.Information("*** LLM Routed: Valid Master Command '{Text}' — Agent Activated ***", transcript);
-                    await ProcessCommandAsync(transcript);
-                }
-                else if (respondTo.StartsWith("speaker_"))
-                {
-                    Log.Information("*** LLM Routed: {Respond} Command '{Text}' ***", respondTo, transcript);
-                    // Optional: await HandleOtherCommand(assignedId, transcript);
-                }
-                else
-                {
-                    Log.Information("*** LLM: Ignore '{Text}' ({Respond}) ***", transcript, respondTo);
-                }
-            }
-        }
-        else if (!string.IsNullOrWhiteSpace(transcript))
-        {
-            Log.Information("*** Skipped LLM: '{Text}' (short/non-command) ***", transcript[..50]);
-        }
-
-        // Optional norm log
-        var embNorm = embedding.Aggregate(0f, (sum, x) => sum + x * x);
-        Log.Debug("Embedding norm: {Norm:F3}", MathF.Sqrt(embNorm));
-
-        audioTimeSec += durationSeconds;  // Update time
-    }
-
-    private static bool IsPotentialCommand(string text)
-    {
-        var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        return words.Length > 2 && (text.Contains('?') || text.Contains('!') || words.Any(w => w.StartsWith("set|play|tell|what|how", StringComparison.OrdinalIgnoreCase)));
     }
 
     private static async Task ProcessCommandAsync(string command)
     {
-        Log.Information("Agent Processing: {Command}", command);
+        Log.Information("IP: Agent Processing: {Command}", command);
         // Integrate your LLM/agent here, e.g., await YourAgent.Execute(command);
         await Task.Delay(100);  // Placeholder
     }
 
     private static void ProcessChunk(VadSpeechSegmenterSileroV5 segmenter, float[] chunk, CancellationToken ct, int chunkCounter)
     {
-        float avgAmp = chunk.Average(Math.Abs);
-        if (chunkCounter % 20 == 0)
-            Log.Information("Chunk #{Chunk} AvgAmp {Amp:F3}", chunkCounter, avgAmp);
-
         var monoPcm = Algos.FloatToPcm16(chunk);
         segmenter.PushFrame(monoPcm, AudioSampleRate, ChunkDurationMs);
         audioTimeSec += (double)ChunkSamples / AudioSampleRate;

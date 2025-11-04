@@ -16,6 +16,9 @@ public class IntentPreprocessor : IDisposable
     private const int MaxLength = 128;
     private const string ModelPath = "models/dialogpt-small-onnx.onnx";
     private const string TokenizerPath = "models/tokenizer.json";
+    private const int NumLayers = 12;  // DialoGPT-small has 12 layers
+    private const int NumHeads = 12;
+    private const int HeadSize = 64;  // hidden_size / num_heads = 768 / 12 = 64
 
     public IntentPreprocessor()
     {
@@ -82,33 +85,88 @@ public class IntentPreprocessor : IDisposable
     public (bool isCommand, string respondTo) Analyze(string transcript, Speaker speaker)
     {
         var prompt = BuildPrompt(transcript, speaker);
-        var tokens = _tokenizer.EncodeToIds(prompt).ToArray();
-        var outputTokens = new List<int>(tokens);
-        int eos = 0;
-        _tokenizer.Vocabulary.TryGetValue("<|endoftext|>", out eos);
+        var inputTokens = _tokenizer.EncodeToIds(prompt).ToArray();
+        var outputTokens = new List<int>(inputTokens); // Start with prompt
 
-        while (outputTokens.Count < MaxLength)
+        if (!_tokenizer.Vocabulary.TryGetValue("<|endoftext|>", out int eosTokenId))
+            throw new InvalidOperationException("EOS token '<|endoftext|>' not in vocabulary.");
+
+        List<NamedOnnxValue>? pastKeyValues = null;
+        const int maxNewTokens = 64; // Prevent infinite generation
+        int generatedCount = 0;
+
+        while (outputTokens.Count < MaxLength && generatedCount < maxNewTokens)
         {
             var currentLength = outputTokens.Count;
+
+            // Input tensors
             var inputIds = outputTokens.Select(t => (long)t).ToArray();
-            var inputTensor = new DenseTensor<long>(inputIds, new[] { 1, currentLength }, false);
-            var inputs = new[] { NamedOnnxValue.CreateFromTensor("input_ids", inputTensor) };
+            var inputTensor = new DenseTensor<long>(inputIds, new[] { 1, currentLength });
+
+            var positionIds = Enumerable.Range(0, currentLength).Select(i => (long)i).ToArray();
+            var positionTensor = new DenseTensor<long>(positionIds, new[] { 1, currentLength });
+
+            var attentionMask = Enumerable.Repeat(1L, currentLength).ToArray();
+            var attentionTensor = new DenseTensor<long>(attentionMask, new[] { 1, currentLength });
+
+            var inputs = new List<NamedOnnxValue>
+        {
+            NamedOnnxValue.CreateFromTensor("input_ids", inputTensor),
+            NamedOnnxValue.CreateFromTensor("position_ids", positionTensor),
+            NamedOnnxValue.CreateFromTensor("attention_mask", attentionTensor)
+        };
+
+            // Add past key values (or empty for first step)
+            if (pastKeyValues != null)
+            {
+                inputs.AddRange(pastKeyValues);
+            }
+            else
+            {
+                for (int layer = 0; layer < NumLayers; layer++)
+                {
+                    var empty = new DenseTensor<float>(new float[0], new[] { 1, NumHeads, 0, HeadSize });
+                    inputs.Add(NamedOnnxValue.CreateFromTensor($"past_key_values.{layer}.key", empty));
+                    inputs.Add(NamedOnnxValue.CreateFromTensor($"past_key_values.{layer}.value", empty));
+                }
+            }
 
             using var result = _session.Run(inputs);
-            var logits = result.First(r => r.Name == "logits").AsTensor<float>();
+            var logitsTensor = result.First(r => r.Name == "logits").AsTensor<float>();
 
-            var lastLogits = new float[logits.Dimensions[2]];
-            for (int v = 0; v < logits.Dimensions[2]; v++)
+            // Get logits for the *last* position
+            var lastLogits = new float[logitsTensor.Dimensions[2]];
+            for (int i = 0; i < lastLogits.Length; i++)
             {
-                lastLogits[v] = logits[0, logits.Dimensions[1] - 1, v];
+                lastLogits[i] = logitsTensor[0, currentLength - 1, i];
             }
-            var nextToken = ArgMaxFloatSpan(lastLogits);
-            if (nextToken == eos) break;
+
+            int nextToken = ArgMaxFloatSpan(lastLogits);
+
+            // Stop if EOS
+            if (nextToken == eosTokenId) break;
+
             outputTokens.Add(nextToken);
+            generatedCount++;
+
+            // Update past_key_values for next iteration
+            pastKeyValues = new List<NamedOnnxValue>();
+            for (int layer = 0; layer < NumLayers; layer++)
+            {
+                var key = result.First(r => r.Name == $"present_key_values.{layer}.key").AsTensor<float>();
+                var value = result.First(r => r.Name == $"present_key_values.{layer}.value").AsTensor<float>();
+                pastKeyValues.Add(NamedOnnxValue.CreateFromTensor($"past_key_values.{layer}.key", key));
+                pastKeyValues.Add(NamedOnnxValue.CreateFromTensor($"past_key_values.{layer}.value", value));
+            }
         }
 
-        var generatedTokens = outputTokens.Skip(tokens.Length);
+        // Only decode newly generated tokens
+        var generatedTokens = outputTokens.Skip(inputTokens.Length);
         var decoded = _tokenizer.Decode(generatedTokens).Trim();
+
+        Log.Debug("Prompt: {Prompt}", prompt);
+        Log.Debug("Generated tokens: {Tokens}", string.Join(", ", generatedTokens));
+        Log.Debug("Decoded output: \"{Output}\"", decoded);
 
         return ParseDecision(decoded, transcript, speaker);
     }
@@ -118,10 +176,10 @@ public class IntentPreprocessor : IDisposable
         var speakerDesc = speaker.Type == SpeakerType.Master ? "Master (enrolled user)" : $"Other Speaker {speaker.Id}";
         return string.Join("\n", new[]
         {
-            $"Context: Multi-speaker env. Transcript from {speakerDesc}: {transcript}",
-            "Is this a valid command (e.g., 'play music', 'set timer')? Yes/No.",
-            "If yes, who to respond to: 'master' for user, 'speaker_X' for others, 'none' if unclear.",
-            "Output ONLY JSON: {\\\"is_command\\\": true/false, \\\"respond_to\\\": \\\"master|speaker_1|speaker_2|or none\\\"}"
+            $"Speaker {speaker.Id} says: {transcript}",
+            "Does this likely contain a command for an AI agent (e.g., 'play music', 'set timer')? Yes/No.",
+            "If yes, who is it intended for: 'master' for the enrolled user, 'speaker_X' for others, 'none' if unclear.",
+            "Output ONLY JSON: {\"is_command\": true/false, \"respond_to\": \"master|speaker_1|speaker_2|none\"}"
         });
     }
 
@@ -136,19 +194,31 @@ public class IntentPreprocessor : IDisposable
 
     private (bool, string) ParseDecision(string decoded, string transcript, Speaker speaker)
     {
-        Log.Debug("Decoded output: {Decoded}", decoded);
+        if (string.IsNullOrWhiteSpace(decoded))
+        {
+            Log.Warning("LLM generated empty output.");
+            return (false, "none");
+        }
+
+        Log.Information("LLM raw output: \"{Output}\"", decoded);
+
         try
         {
-            using var jsonDoc = JsonDocument.Parse(decoded);
-            var root = jsonDoc.RootElement;
-            var isCmd = root.GetProperty("is_command").GetBoolean();
-            var respond = root.GetProperty("respond_to").GetString() ?? "none";
-            Log.Information("LLM: {IsCmd}, {Respond} | {Type}:{Id} | {Text:50}", isCmd, respond, speaker.Type, speaker.Id, transcript);
-            return (isCmd, respond);
+            using var doc = JsonDocument.Parse(decoded);
+            var root = doc.RootElement;
+            bool isCmd = root.TryGetProperty("is_command", out var cmdProp) && cmdProp.ValueKind == JsonValueKind.True;
+            string respondTo = root.TryGetProperty("respond_to", out var toProp)
+                ? toProp.GetString() ?? "none"
+                : "none";
+
+            Log.Information("LLM Decision → Command: {Cmd}, RespondTo: {To} | Speaker: {Type}{Id} | \"{Text}\"",
+                isCmd, respondTo, speaker.Type, speaker.Id, transcript.Trim());
+
+            return (isCmd, respondTo);
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is JsonException || ex is InvalidOperationException)
         {
-            Log.Warning("Invalid JSON: {Decoded}; default none.", decoded);
+            Log.Warning(ex, "Failed to parse LLM JSON output: \"{Output}\"", decoded);
             return (false, "none");
         }
     }

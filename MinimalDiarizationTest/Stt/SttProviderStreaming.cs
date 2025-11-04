@@ -255,7 +255,7 @@ public class SttProviderStreaming : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Streaming STT: Processing failed");
+            Log.Error($"Streaming STT: Processing failed -- {ex.Message}");
         }
     }
 
