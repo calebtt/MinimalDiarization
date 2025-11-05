@@ -227,6 +227,7 @@ internal static class Program
         }
 
         // ---- Intent (runs on **every** transcription) ----------------
+        Log.Information("IP: Transcript: \"{Transcript}\" (Speaker {SpeakerId})", transcript, assigned.Id);
         bool isCommand = await _intentPreprocessor!.IsCommandAsync(transcript, assigned);
         Log.Information("IP: Intent Analysis: isCommand={IsCommand}", isCommand);
         if (isCommand)
@@ -237,7 +238,7 @@ internal static class Program
 
     private static async Task ProcessCommandAsync(string command)
     {
-        Log.Information("IP: Agent Processing: {Command}", command);
+        Log.Information("IP: *** Agent Processing Command *** : {Command}", command);
         // Integrate LLM/agent here, e.g., await YourAgent.Execute(command);
         await Task.Delay(100);  // Placeholder
     }

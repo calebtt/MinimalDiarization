@@ -231,7 +231,6 @@ public class SttProviderStreaming : IDisposable
                 return;
             }
             Array.Resize(ref pcmBytes, bytesRead); // Trim if partial read
-            Log.Debug("Streaming STT: Processing chunk of {0} bytes", pcmBytes.Length);
 
             using var wavStream = Algos.PcmToWavStream(pcmBytes, _waveFormat);
 
@@ -317,7 +316,7 @@ public class SttProviderStreaming : IDisposable
                 // Combine segments into complete transcription
                 var completeText = string.Join(" ", recentSegments.Select(s => s.Text));
 
-                Log.Information("Streaming STT: Complete transcription ready: '{0}'", completeText);
+                Log.Debug("Streaming STT: Complete transcription ready: '{0}'", completeText);
 
                 // Clear recent segments to prevent accumulation in next transcription
                 lock (_recentSegmentsLock)
