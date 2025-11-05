@@ -1,7 +1,7 @@
 using NAudio.Wave;
 using Serilog;
 using System.Collections.Concurrent;
-using Whisper.net; // For TranscriptionSegment
+using Whisper.net;
 
 namespace MinimalVadTest;
 

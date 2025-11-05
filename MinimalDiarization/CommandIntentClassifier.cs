@@ -1,6 +1,4 @@
-﻿// CommandIntentClassifier.cs (improved)
-using Microsoft.Extensions.AI;
-using Microsoft.SemanticKernel;
+﻿using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Serilog;
@@ -13,7 +11,12 @@ public sealed class CommandIntentClassifier
 {
     private const string IsDirectedAtAssistantKey = "directedAtAssistant";
     private const string ConfidenceKey = "confidence";
+    private const double ConfidenceThreshold = 0.5;
+    private const int MaxTokens = 19;
+    private const double Temperature = 0.1;
+    private const double TopP = 0.1;
 
+    // SemanticKernel chat completion service
     private readonly IChatCompletionService _chat;
 
     public CommandIntentClassifier(IChatCompletionService chatService)
@@ -52,12 +55,12 @@ Utterance (Speaker {0}): ""{1}""
 
         try
         {
-            // If your IChatCompletionService allows setting options, set temperature=0
-            // For example: var response = await _chat.GetChatMessageContentAsync(history, new ChatOptions{ Temperature = 0 });
-            var settings = new OpenAIPromptExecutionSettings();
-            settings.MaxTokens = 19;
-            settings.Temperature = 0.1;
-            settings.TopP = 0.1;
+            var settings = new OpenAIPromptExecutionSettings()
+            {
+                MaxTokens = MaxTokens,
+                Temperature = Temperature,
+                TopP = TopP
+            };
             var response = await _chat.GetChatMessageContentAsync(history, settings);
             var raw = (response?.Content ?? "").Trim();
             Log.Debug("Raw classifier response: {Raw}", raw);
@@ -70,9 +73,9 @@ Utterance (Speaker {0}): ""{1}""
                 bool isCommand = root.GetProperty(IsDirectedAtAssistantKey).GetBoolean();
                 double confidence = root.GetProperty(ConfidenceKey).GetDouble();
 
-                Log.Information("Intent: \"{Text}\" → {Answer} (conf {Conf:F2})", transcript, isCommand ? "YES" : "NO", confidence);
+                Log.Debug("Intent: \"{Text}\" -> {Answer} (conf {Conf:F2})", transcript, isCommand ? "YES" : "NO", confidence);
                 // Use a confidence threshold; tune as needed
-                return isCommand && confidence >= 0.5;
+                return isCommand && confidence >= ConfidenceThreshold;
             }
             catch (JsonException)
             {
@@ -94,7 +97,7 @@ Utterance (Speaker {0}): ""{1}""
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Classifier inference failed: {Text}", transcript);
+            Log.Error($"Classifier inference failed: {ex.Message}");
             // On error, fallback locally
             return LocalRuleBasedClassifier(transcript);
         }

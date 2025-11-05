@@ -1,9 +1,5 @@
-﻿using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
-using Microsoft.SemanticKernel;
+﻿using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
-using Microsoft.SemanticKernel.Connectors.Onnx;
-using Microsoft.Extensions.AI;
 using MinimalDiarization.Core;
 using MinimalSileroVAD.Core;  // For VadSpeechSegmenterSileroV5
 using MinimalVadTest;
@@ -16,6 +12,34 @@ namespace MinimalDiarizationTest;
 
 public static partial class Algos
 {
+    // Test the intent preprocessor with sample inputs
+    public static async Task TestIntentPreprocessor(CommandIntentClassifier intent)
+    {
+        var tests = new[]
+        {
+        ("Hey computer, turn on the lights.", true),
+        ("What's the weather?", true),
+        ("Play music.", true),
+        ("Who are you?", false),
+        ("I'll make sure you feel confident the whole way through.", false),
+        ("Please open the pod bay doors.", true),
+        ("Can you tell me a joke?", true),
+        ("This is a random sentence.", false),
+        ("Computer, initiate self-destruct sequence.", true),
+        ("I love programming.", false),
+        ("There's a snake in my boot.", false)
+    };
+
+        foreach (var (cmd, expected) in tests)
+        {
+            var speaker = cmd.Contains("master") ? new Speaker(SpeakerType.Master, 0, new float[192])
+                         : new Speaker(SpeakerType.Other, 1, new float[192]);
+
+            bool isCmd = await intent.IsCommandAsync(cmd, speaker);
+            Log.Information("Test: \"{Cmd}\" -> {Result} (expected: {Exp})", cmd, isCmd ? "YES" : "NO", expected ? "YES" : "NO");
+        }
+    }
+
     // Helper: Compute cosine similarity between two embeddings (for speaker change detection)
     public static float CosineSimilarity(ReadOnlySpan<float> emb1, ReadOnlySpan<float> emb2)
     {
@@ -63,18 +87,15 @@ internal static class Program
     private static CommandIntentClassifier? _intentPreprocessor;
     private static SttProviderStreaming? _sttProvider;
     private static CancellationTokenSource _cts = new();
+    private static Kernel? _kernel;
+    private static IChatCompletionService? _chatService;
 
-    private static async Task Main(string[] _)
+    private static (Kernel, IChatCompletionService, CommandIntentClassifier) BuildKernel()
     {
-        Log.Logger = new LoggerConfiguration()
-            .WriteTo.Console(outputTemplate: "{Timestamp:HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}")
-            .MinimumLevel.Information()
-            .CreateLogger();
-
-        var modelFolder = Path.Combine(AppContext.BaseDirectory, "models", "phi3-mini");
+        var modelFolder = Path.Combine(AppContext.BaseDirectory, "models", "phi3-mini-gpu");
         var builder = Kernel.CreateBuilder();
 
-        // Now works with genai_config.json present
+        // Requires genai_config.json present
         builder.Services.AddOnnxRuntimeGenAIChatCompletion(
             modelId: "phi3-mini",
             modelPath: modelFolder,  // Folder path—loads genai_config.json automatically
@@ -83,14 +104,24 @@ internal static class Program
 
         var kernel = builder.Build();
         var chatService = kernel.GetRequiredService<IChatCompletionService>();
-        _intentPreprocessor = new CommandIntentClassifier(chatService);
+        return (kernel, chatService, new CommandIntentClassifier(chatService));
+    }
 
-        await TestIntentPreprocessor(_intentPreprocessor);
-
-        Console.ReadKey();
+    private static async Task Main(string[] _)
+    {
+        Log.Logger = new LoggerConfiguration()
+            .WriteTo.Console(outputTemplate: "{Timestamp:HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}")
+            .MinimumLevel.Information()
+            .CreateLogger();
 
         try
         {
+            // Intent preprocessor setup
+            (_kernel, _chatService, _intentPreprocessor) = BuildKernel();
+            await Algos.TestIntentPreprocessor(_intentPreprocessor);
+            //Console.ReadKey();
+
+            // ECAPA model setup for speaker diarization
             var modelPath = Path.Combine("models", "ecapa_tdnn.onnx");
             if (!File.Exists(modelPath))
                 throw new FileNotFoundException($"ECAPA model not found at {modelPath}; run export_ecapa_onnx.py to generate.");
@@ -100,7 +131,7 @@ internal static class Program
             _speakerTracker = new SpeakerTracker(_ecapaModel);
             _sttProvider = new SttProviderStreaming();
 
-            await EnrollOrLoadVoice(_ecapaModel);
+            //await EnrollOrLoadVoiceAsync(_ecapaModel);
 
             Log.Information("Starting MinimalDiarizationTest");
             Log.Information("EnableEcho: {EnableEcho}", EnableEcho);
@@ -120,7 +151,7 @@ internal static class Program
             }
         }
         catch (OperationCanceledException) { Log.Information("Capture stopped (Ctrl+C)."); }
-        catch (Exception ex) { Log.Error(ex, "Application error"); }
+        catch (Exception ex) { Log.Error("Application error: {ex.Message}", ex.Message); }
         finally
         {
             _speakerTracker?.Dispose();
@@ -128,34 +159,7 @@ internal static class Program
         }
     }
 
-    private static async Task TestIntentPreprocessor(CommandIntentClassifier intent)
-    {
-        var tests = new[]
-        {
-        ("Hey computer, turn on the lights.", true),
-        ("What's the weather?", true),
-        ("Play music.", true),
-        ("Who are you?", false),
-        ("I'll make sure you feel confident the whole way through.", false),
-        ("Please open the pod bay doors.", true),
-        ("Can you tell me a joke?", true),
-        ("This is a random sentence.", false),
-        ("Computer, initiate self-destruct sequence.", true),
-        ("I love programming.", false),
-        ("There's a snake in my boot.", false)
-    };
-
-        foreach (var (cmd, expected) in tests)
-        {
-            var speaker = cmd.Contains("master") ? new Speaker(SpeakerType.Master, 0, new float[192])
-                         : new Speaker(SpeakerType.Other, 1, new float[192]);
-
-            bool isCmd = await intent.IsCommandAsync(cmd, speaker);
-            Log.Information("Test: \"{Cmd}\" -> {Result} (expected: {Exp})", cmd, isCmd ? "YES" : "NO", expected ? "YES" : "NO");
-        }
-    }
-
-    private static async Task EnrollOrLoadVoice(EcapaTdnnModel ecapaModel)
+    private static async Task EnrollOrLoadVoiceAsync(EcapaTdnnModel ecapaModel)
     {
         var enroller = new UserVoiceEnroller(ecapaModel);
         _userEmbedding = await enroller.LoadAsync();
@@ -223,8 +227,8 @@ internal static class Program
         }
 
         // ---- Intent (runs on **every** transcription) ----------------
-        var isCommand = await _intentPreprocessor!.IsCommandAsync(transcript, assigned);
-        Log.Information("IP: Intent Analysis: isCommand={IsCommand}, respondTo={RespondTo}", isCommand);
+        bool isCommand = await _intentPreprocessor!.IsCommandAsync(transcript, assigned);
+        Log.Information("IP: Intent Analysis: isCommand={IsCommand}", isCommand);
         if (isCommand)
         {
             await ProcessCommandAsync(transcript);
@@ -234,7 +238,7 @@ internal static class Program
     private static async Task ProcessCommandAsync(string command)
     {
         Log.Information("IP: Agent Processing: {Command}", command);
-        // Integrate your LLM/agent here, e.g., await YourAgent.Execute(command);
+        // Integrate LLM/agent here, e.g., await YourAgent.Execute(command);
         await Task.Delay(100);  // Placeholder
     }
 

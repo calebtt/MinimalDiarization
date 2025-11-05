@@ -1,10 +1,11 @@
 ﻿using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
-using System.Numerics;
 using Serilog;
+using System.Numerics;
 
 namespace MinimalDiarization.Core;
 
+// TODO consider SemanticKernel integration as an embedding plugin
 public class EcapaTdnnModel : IDisposable
 {
     private readonly InferenceSession _session;
