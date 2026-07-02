@@ -37,12 +37,31 @@ public static partial class Algos
         return bytes;
     }
 
-    // Tunable: Lower for noisy envs like movies (ECAPA baseline ~0.6-0.8)
-    public const float SpeakerMatchThreshold = 0.4f;
+    // Tunable within ECAPA baseline ~0.6-0.8; too low merges distinct speakers together.
+    public const float SpeakerMatchThreshold = 0.65f;
+
+    // Incrementally folds a new embedding into a running mean and re-normalizes to unit
+    // length (embeddings are L2-normalized, and cosine similarity assumes that).
+    public static float[] UpdateRunningMean(float[] existingMean, int existingCount, ReadOnlySpan<float> newEmbedding)
+    {
+        var updated = new float[existingMean.Length];
+        for (int i = 0; i < updated.Length; i++)
+            updated[i] = (existingMean[i] * existingCount + newEmbedding[i]) / (existingCount + 1);
+
+        float norm = 0f;
+        for (int i = 0; i < updated.Length; i++)
+            norm += updated[i] * updated[i];
+        norm = MathF.Sqrt(norm);
+        if (norm > 1e-8f)
+            for (int i = 0; i < updated.Length; i++)
+                updated[i] /= norm;
+
+        return updated;
+    }
 }
 
-// Speaker record: Immutable, holds ID + embedding for clustering
-public record Speaker(int Id, float[] Embedding);
+// Speaker record: holds ID + running-mean embedding + sample count for clustering.
+public record Speaker(int Id, float[] Embedding, int Count = 1);
 
 // Minimal diarization test app: Mic -> VAD segments -> ECAPA embeddings -> multi-speaker clustering.
 // Requires: silero_vad.onnx in /models/, ecapa_tdnn.onnx in /models/.
@@ -173,12 +192,19 @@ internal static class Program
             Log.Information("*** New Speaker {Id} (first segment) ***", assignedId);
         }
 
-        // Add/update: Store embedding for this speaker (overwrite for stability; avg if needed later)
-        var embeddingArray = embedding.ToArray();
+        // Add/update: fold into a running mean rather than overwriting, so a single noisy
+        // or short utterance can't drag a speaker's reference embedding off track.
         var existing = _knownSpeakers.FirstOrDefault(s => s.Id == assignedId);
         if (existing != null)
-            _knownSpeakers.Remove(existing);  // Replace for latest
-        _knownSpeakers.Add(new Speaker(assignedId, embeddingArray));
+        {
+            _knownSpeakers.Remove(existing);
+            var updatedEmbedding = Algos.UpdateRunningMean(existing.Embedding, existing.Count, embedding);
+            _knownSpeakers.Add(existing with { Embedding = updatedEmbedding, Count = existing.Count + 1 });
+        }
+        else
+        {
+            _knownSpeakers.Add(new Speaker(assignedId, embedding.ToArray()));
+        }
 
         // Optional: Log embedding norm for debugging
         var embNorm = embedding.Aggregate(0f, (sum, x) => sum + x * x);
