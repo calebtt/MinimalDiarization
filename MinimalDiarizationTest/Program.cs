@@ -1,6 +1,7 @@
 ﻿using Microsoft.ML.OnnxRuntime;
 using NAudio.Wave;
 using Serilog;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 using MinimalSileroVAD.Core;  // For VadSpeechSegmenterSileroV5
@@ -111,8 +112,15 @@ internal static class Program
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
             Log.Information("Press Ctrl+C to stop…");
 
+            // NAudio's WaveInEvent P/Invokes winmm.dll and only works on Windows; use a
+            // parec (PipeWire/PulseAudio) subprocess for mic capture everywhere else.
+            var micDevice = Environment.GetEnvironmentVariable("MIC_DEVICE") ?? "@DEFAULT_SOURCE@";
+            var captureStream = OperatingSystem.IsWindows()
+                ? CaptureAndEchoMicrophoneChunksAsync(ChunkSamples, EnableEcho, cts.Token)
+                : CaptureMicrophoneChunksViaParecAsync(ChunkSamples, micDevice, cts.Token);
+
             int chunkCounter = 0;
-            await foreach (var rawChunk in CaptureAndEchoMicrophoneChunksAsync(ChunkSamples, EnableEcho, cts.Token))
+            await foreach (var rawChunk in captureStream)
             {
                 if (cts.Token.IsCancellationRequested) break;
                 chunkCounter++;
@@ -272,6 +280,62 @@ internal static class Program
             waveIn.StopRecording();
             waveOut?.Stop();
             waveOut?.Dispose();
+        }
+    }
+
+    // Linux/macOS mic capture: shells out to `parec` (PipeWire/PulseAudio) for raw
+    // 16kHz/16-bit/mono PCM instead of NAudio's Windows-only device APIs.
+    private static async IAsyncEnumerable<float[]> CaptureMicrophoneChunksViaParecAsync(
+        int chunkSamples, string device, [EnumeratorCancellation] CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "parec",
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("--raw");
+        psi.ArgumentList.Add($"--device={device}");
+        psi.ArgumentList.Add($"--rate={AudioSampleRate}");
+        psi.ArgumentList.Add("--format=s16le");
+        psi.ArgumentList.Add("--channels=1");
+        // PipeWire/PulseAudio's default client latency target is ~2000ms, which makes
+        // parec buffer audio in ~2s bursts instead of streaming it continuously. Request
+        // a short latency so chunks arrive close to real time.
+        psi.ArgumentList.Add("--latency-msec=50");
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start parec for microphone capture.");
+        Log.Information("Capturing microphone via parec (device={Device})…", device);
+
+        try
+        {
+            var stdout = process.StandardOutput.BaseStream;
+            int chunkBytes = chunkSamples * 2;
+            var buffer = new byte[chunkBytes];
+
+            while (!ct.IsCancellationRequested)
+            {
+                int read = 0;
+                while (read < chunkBytes)
+                {
+                    int n = await stdout.ReadAsync(buffer.AsMemory(read, chunkBytes - read), ct);
+                    if (n == 0)
+                        yield break;  // parec exited or stream closed
+                    read += n;
+                }
+
+                var chunk = new float[chunkSamples];
+                for (int i = 0; i < chunkSamples; i++)
+                    chunk[i] = BitConverter.ToInt16(buffer, i * 2) / 32768f;
+
+                yield return chunk;
+            }
+        }
+        finally
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
         }
     }
 }
