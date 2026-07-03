@@ -1,6 +1,7 @@
 ﻿using Microsoft.ML.OnnxRuntime;
 using NAudio.Wave;
 using Serilog;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 using MinimalSileroVAD.Core;  // For VadSpeechSegmenterSileroV5
@@ -37,12 +38,31 @@ public static partial class Algos
         return bytes;
     }
 
-    // Tunable: Lower for noisy envs like movies (ECAPA baseline ~0.6-0.8)
-    public const float SpeakerMatchThreshold = 0.4f;
+    // Tunable within ECAPA baseline ~0.6-0.8; too low merges distinct speakers together.
+    public const float SpeakerMatchThreshold = 0.65f;
+
+    // Incrementally folds a new embedding into a running mean and re-normalizes to unit
+    // length (embeddings are L2-normalized, and cosine similarity assumes that).
+    public static float[] UpdateRunningMean(float[] existingMean, int existingCount, ReadOnlySpan<float> newEmbedding)
+    {
+        var updated = new float[existingMean.Length];
+        for (int i = 0; i < updated.Length; i++)
+            updated[i] = (existingMean[i] * existingCount + newEmbedding[i]) / (existingCount + 1);
+
+        float norm = 0f;
+        for (int i = 0; i < updated.Length; i++)
+            norm += updated[i] * updated[i];
+        norm = MathF.Sqrt(norm);
+        if (norm > 1e-8f)
+            for (int i = 0; i < updated.Length; i++)
+                updated[i] /= norm;
+
+        return updated;
+    }
 }
 
-// Speaker record: Immutable, holds ID + embedding for clustering
-public record Speaker(int Id, float[] Embedding);
+// Speaker record: holds ID + running-mean embedding + sample count for clustering.
+public record Speaker(int Id, float[] Embedding, int Count = 1);
 
 // Minimal diarization test app: Mic -> VAD segments -> ECAPA embeddings -> multi-speaker clustering.
 // Requires: silero_vad.onnx in /models/, ecapa_tdnn.onnx in /models/.
@@ -92,8 +112,15 @@ internal static class Program
             Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
             Log.Information("Press Ctrl+C to stop…");
 
+            // NAudio's WaveInEvent P/Invokes winmm.dll and only works on Windows; use a
+            // parec (PipeWire/PulseAudio) subprocess for mic capture everywhere else.
+            var micDevice = Environment.GetEnvironmentVariable("MIC_DEVICE") ?? "@DEFAULT_SOURCE@";
+            var captureStream = OperatingSystem.IsWindows()
+                ? CaptureAndEchoMicrophoneChunksAsync(ChunkSamples, EnableEcho, cts.Token)
+                : CaptureMicrophoneChunksViaParecAsync(ChunkSamples, micDevice, cts.Token);
+
             int chunkCounter = 0;
-            await foreach (var rawChunk in CaptureAndEchoMicrophoneChunksAsync(ChunkSamples, EnableEcho, cts.Token))
+            await foreach (var rawChunk in captureStream)
             {
                 if (cts.Token.IsCancellationRequested) break;
                 chunkCounter++;
@@ -173,12 +200,19 @@ internal static class Program
             Log.Information("*** New Speaker {Id} (first segment) ***", assignedId);
         }
 
-        // Add/update: Store embedding for this speaker (overwrite for stability; avg if needed later)
-        var embeddingArray = embedding.ToArray();
+        // Add/update: fold into a running mean rather than overwriting, so a single noisy
+        // or short utterance can't drag a speaker's reference embedding off track.
         var existing = _knownSpeakers.FirstOrDefault(s => s.Id == assignedId);
         if (existing != null)
-            _knownSpeakers.Remove(existing);  // Replace for latest
-        _knownSpeakers.Add(new Speaker(assignedId, embeddingArray));
+        {
+            _knownSpeakers.Remove(existing);
+            var updatedEmbedding = Algos.UpdateRunningMean(existing.Embedding, existing.Count, embedding);
+            _knownSpeakers.Add(existing with { Embedding = updatedEmbedding, Count = existing.Count + 1 });
+        }
+        else
+        {
+            _knownSpeakers.Add(new Speaker(assignedId, embedding.ToArray()));
+        }
 
         // Optional: Log embedding norm for debugging
         var embNorm = embedding.Aggregate(0f, (sum, x) => sum + x * x);
@@ -246,6 +280,62 @@ internal static class Program
             waveIn.StopRecording();
             waveOut?.Stop();
             waveOut?.Dispose();
+        }
+    }
+
+    // Linux/macOS mic capture: shells out to `parec` (PipeWire/PulseAudio) for raw
+    // 16kHz/16-bit/mono PCM instead of NAudio's Windows-only device APIs.
+    private static async IAsyncEnumerable<float[]> CaptureMicrophoneChunksViaParecAsync(
+        int chunkSamples, string device, [EnumeratorCancellation] CancellationToken ct)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "parec",
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("--raw");
+        psi.ArgumentList.Add($"--device={device}");
+        psi.ArgumentList.Add($"--rate={AudioSampleRate}");
+        psi.ArgumentList.Add("--format=s16le");
+        psi.ArgumentList.Add("--channels=1");
+        // PipeWire/PulseAudio's default client latency target is ~2000ms, which makes
+        // parec buffer audio in ~2s bursts instead of streaming it continuously. Request
+        // a short latency so chunks arrive close to real time.
+        psi.ArgumentList.Add("--latency-msec=50");
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("Failed to start parec for microphone capture.");
+        Log.Information("Capturing microphone via parec (device={Device})…", device);
+
+        try
+        {
+            var stdout = process.StandardOutput.BaseStream;
+            int chunkBytes = chunkSamples * 2;
+            var buffer = new byte[chunkBytes];
+
+            while (!ct.IsCancellationRequested)
+            {
+                int read = 0;
+                while (read < chunkBytes)
+                {
+                    int n = await stdout.ReadAsync(buffer.AsMemory(read, chunkBytes - read), ct);
+                    if (n == 0)
+                        yield break;  // parec exited or stream closed
+                    read += n;
+                }
+
+                var chunk = new float[chunkSamples];
+                for (int i = 0; i < chunkSamples; i++)
+                    chunk[i] = BitConverter.ToInt16(buffer, i * 2) / 32768f;
+
+                yield return chunk;
+            }
+        }
+        finally
+        {
+            if (!process.HasExited)
+                process.Kill(entireProcessTree: true);
         }
     }
 }

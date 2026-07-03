@@ -34,7 +34,15 @@ public class EcapaTdnnModel : IDisposable
             {
                 GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_EXTENDED
             };
-            opts.AppendExecutionProvider_CUDA(); // CUDA if available
+            try
+            {
+                opts.AppendExecutionProvider_CUDA();
+                Log.Information("CUDA execution provider enabled.");
+            }
+            catch (OnnxRuntimeException ex)
+            {
+                Log.Warning(ex, "CUDA execution provider unavailable; falling back to CPU.");
+            }
 
             using var memoryStream = new MemoryStream();
             modelStream.CopyTo(memoryStream);
@@ -97,13 +105,28 @@ public class EcapaTdnnModel : IDisposable
     private float[,] ComputeMelSpectrogram(ReadOnlySpan<float> waveform)
     {
         int numFreqs = Nfft / 2 + 1;
-        int numFrames = (waveform.Length + HopLength - 1) / HopLength;
+
+        // Center-pad (reflect) so the first frame is centered at t=0, matching
+        // torchaudio.transforms.MelSpectrogram's default (center=True, pad_mode="reflect"),
+        // which is what the reference SpeechBrain export pipeline uses.
+        int pad = Nfft / 2;
+        int n = waveform.Length;
+        var padded = new float[n + 2 * pad];
+        waveform.CopyTo(padded.AsSpan(pad, n));
+        for (int j = 0; j < pad; j++)
+        {
+            padded[j] = waveform[pad - j];
+            padded[pad + n + j] = waveform[n - 2 - j];
+        }
+
+        int numFrames = 1 + n / HopLength;
         var powerSpec = new float[numFrames, numFreqs];  // Amplitude spectrum
 
-        // Hann window
+        // Periodic Hann window (matches torch.hann_window's default periodic=True,
+        // not the symmetric/(N-1) variant)
         Span<float> window = stackalloc float[WinLength];
         for (int i = 0; i < WinLength; i++)
-            window[i] = 0.5f * (1f - MathF.Cos(2f * MathF.PI * i / (WinLength - 1)));
+            window[i] = 0.5f * (1f - MathF.Cos(2f * MathF.PI * i / WinLength));
 
         // Reusable buffers (moved outside loop to avoid stack overflow)
         Span<float> frameData = stackalloc float[WinLength];
@@ -113,10 +136,7 @@ public class EcapaTdnnModel : IDisposable
         for (int frame = 0; frame < numFrames; frame++)
         {
             int start = frame * HopLength;
-            int end = Math.Min(start + WinLength, waveform.Length);
-            int copyLen = end - start;
-            waveform.Slice(start, copyLen).CopyTo(frameData[..copyLen]);
-            frameData[copyLen..].Fill(0f);  // Zero-pad
+            padded.AsSpan(start, WinLength).CopyTo(frameData);
 
             // Window
             for (int i = 0; i < WinLength; i++)
@@ -263,12 +283,16 @@ public class EcapaTdnnModel : IDisposable
             }
         }
 
-        // Slaney normalization: divide by mel band width
+        // Slaney normalization: scale each filter by 2 / (bandwidth in Hz) so filter
+        // "area" is equalized across the mel axis (librosa/torchaudio norm="slaney").
+        // Note this must use the Hz-space triangle width (hzPoints[m+2]-hzPoints[m]),
+        // not the mel-space step, which is constant across filters by construction
+        // and so wouldn't correct anything.
         for (int m = 0; m < NMels; m++)
         {
-            float melWidth = melPoints[m + 1] - melPoints[m];
+            float enorm = 2f / (hzPoints[m + 2] - hzPoints[m]);
             for (int k = 0; k < numFreqs; k++)
-                basis[k, m] /= melWidth;
+                basis[k, m] *= enorm;
         }
 
         // Flatten row-major [freq * mels]
@@ -279,8 +303,20 @@ public class EcapaTdnnModel : IDisposable
         return flat;
     }
 
-    private static float HzToMel(float hz) => 2595f * MathF.Log10(1f + hz / 700f);
-    private static float MelToHz(float mel) => 700f * ((float)Math.Pow(10, mel / 2595f) - 1f);
+    // Slaney (Auditory Toolbox) mel scale: linear below 1kHz, log above — NOT the HTK
+    // 2595*log10(1+f/700) formula. The exported model's front-end config specifies
+    // mel_scale="slaney", so the two must match or filter centers land at the wrong
+    // frequencies entirely.
+    private const float FSp = 200f / 3f;
+    private const float MinLogHz = 1000f;
+    private const float MinLogMel = MinLogHz / FSp;
+    private static readonly float LogStep = MathF.Log(6.4f) / 27f;
+
+    private static float HzToMel(float hz) =>
+        hz < MinLogHz ? hz / FSp : MinLogMel + MathF.Log(hz / MinLogHz) / LogStep;
+
+    private static float MelToHz(float mel) =>
+        mel < MinLogMel ? mel * FSp : MinLogHz * MathF.Exp(LogStep * (mel - MinLogMel));
 
     private static void NormalizeL2(Span<float> vec)
     {
